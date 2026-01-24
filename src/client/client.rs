@@ -1,24 +1,33 @@
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use futures::{Stream, StreamExt};
 use futures_util::TryStreamExt;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::client::decoder::body_to_framed_stream;
 use crate::{Message, client::client_id::ClientId};
 
-pub struct Client {
+pub struct Client<T> {
     url: String,
     client_id: ClientId,
 
     reqwest_client: reqwest::Client,
+
+    _marker: PhantomData<T>,
 }
 
-impl Client {
+impl Client<()> {
     pub fn builder() -> ClientBuilder {
         ClientBuilder::default()
     }
+}
 
+impl<T> Client<T>
+where
+    T: serde::de::DeserializeOwned + Send + 'static,
+{
     pub async fn poll_once(
         &self,
     ) -> Result<impl Stream<Item = Result<Message<Value>, std::io::Error>>, reqwest::Error> {
@@ -80,7 +89,10 @@ impl ClientBuilder {
         self
     }
 
-    pub fn build(self) -> Client {
+    pub fn build<T>(self) -> Client<T>
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
         Client {
             url: match self.url {
                 Some(url) => url,
@@ -94,6 +106,7 @@ impl ClientBuilder {
                 Some(reqwest) => reqwest,
                 None => reqwest::Client::default(),
             },
+            _marker: PhantomData,
         }
     }
 }
@@ -104,8 +117,8 @@ mod tests {
     #[tokio::test]
     async fn client_test() -> anyhow::Result<()> {
         let client = Client::builder()
-            .url("https://forum.warthunder.com/message-bus/")
-            .build();
+            .url("https://forum.example.com/message-bus/")
+            .build::<Value>();
 
         let mut stream = client.poll_once().await?;
 
