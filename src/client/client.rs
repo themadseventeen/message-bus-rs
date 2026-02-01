@@ -58,21 +58,12 @@ where
     }
 }
 
+#[derive(Default)]
 pub struct ClientBuilder {
     url: Option<String>,
     client_id: Option<ClientId>,
 
     reqwest_client: Option<reqwest::Client>,
-}
-
-impl Default for ClientBuilder {
-    fn default() -> Self {
-        ClientBuilder {
-            url: None,
-            client_id: None,
-            reqwest_client: None,
-        }
-    }
 }
 
 impl ClientBuilder {
