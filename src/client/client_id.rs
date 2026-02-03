@@ -67,8 +67,7 @@ mod tests {
 
     #[test]
     fn from_string() {
-        let mut s: String = String::default();
-        s = String::from("deadbeefdeadbeef");
+        let mut s = String::from("deadbeefdeadbeef");
         assert!(ClientId::try_from(&s).is_ok());
         assert!(ClientId::try_from(s.as_str()).is_ok());
         s = String::from("1234567890abcdef");

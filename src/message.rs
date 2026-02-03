@@ -1,9 +1,59 @@
 use serde::Deserialize;
+use serde::de::{self, DeserializeOwned, Deserializer};
+use serde_json::Value;
+use std::collections::HashMap;
 
-#[derive(Deserialize, Debug)]
-pub struct Message<T> {
+#[derive(Deserialize, Debug, Clone)]
+pub struct Message<T>
+where
+    T: Clone,
+{
     pub global_id: i64,
     pub message_id: i64,
     pub channel: String,
     pub data: T,
+}
+
+#[derive(Debug, Clone)]
+pub enum MessageType<T>
+where
+    T: Clone,
+{
+    Status(HashMap<String, i64>),
+    Normal(Message<T>),
+}
+
+impl<'de, T> Deserialize<'de> for MessageType<T>
+where
+    T: DeserializeOwned + Clone,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawMessage {
+            global_id: i64,
+            message_id: i64,
+            channel: String,
+            data: Value,
+        }
+
+        let raw = RawMessage::deserialize(deserializer)?;
+
+        if raw.channel == "/__status" {
+            let map: HashMap<String, i64> = serde_json::from_value(raw.data)
+                .map_err(|e| de::Error::custom(format!("invalid status data format: {}", e)))?;
+            Ok(MessageType::Status(map))
+        } else {
+            let data: T = serde_json::from_value::<T>(raw.data)
+                .map_err(|e| de::Error::custom(format!("invalid normal data format: {}", e)))?;
+            Ok(MessageType::Normal(Message {
+                global_id: raw.global_id,
+                message_id: raw.message_id,
+                channel: raw.channel,
+                data,
+            }))
+        }
+    }
 }

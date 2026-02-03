@@ -9,9 +9,7 @@ use tokio_util::io::StreamReader;
 pub fn body_to_framed_stream(
     resp: reqwest::Response,
 ) -> impl futures::Stream<Item = Result<serde_json::Value, io::Error>> {
-    let byte_stream = resp
-        .bytes_stream()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+    let byte_stream = resp.bytes_stream().map_err(io::Error::other);
 
     let reader = StreamReader::new(byte_stream);
     FramedRead::new(reader, MessageBusCodec)
