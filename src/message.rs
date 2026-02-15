@@ -3,8 +3,17 @@ use serde::de::{self, DeserializeOwned, Deserializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone)]
+pub enum PollerMessage<T>
+where
+    T: Clone,
+{
+    UserMessage(UserMessage<T>),
+    PollEnded,
+}
+
 #[derive(Deserialize, Debug, Clone)]
-pub struct Message<T>
+pub struct UserMessage<T>
 where
     T: Clone,
 {
@@ -15,15 +24,15 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub enum MessageType<T>
+pub enum Data<T>
 where
     T: Clone,
 {
     Status(HashMap<String, i64>),
-    Normal(Message<T>),
+    Normal(UserMessage<T>),
 }
 
-impl<'de, T> Deserialize<'de> for MessageType<T>
+impl<'de, T> Deserialize<'de> for Data<T>
 where
     T: DeserializeOwned + Clone,
 {
@@ -44,11 +53,11 @@ where
         if raw.channel == "/__status" {
             let map: HashMap<String, i64> = serde_json::from_value(raw.data)
                 .map_err(|e| de::Error::custom(format!("invalid status data format: {}", e)))?;
-            Ok(MessageType::Status(map))
+            Ok(Data::Status(map))
         } else {
             let data: T = serde_json::from_value::<T>(raw.data)
                 .map_err(|e| de::Error::custom(format!("invalid normal data format: {}", e)))?;
-            Ok(MessageType::Normal(Message {
+            Ok(Data::Normal(UserMessage {
                 global_id: raw.global_id,
                 message_id: raw.message_id,
                 channel: raw.channel,

@@ -2,4 +2,4 @@ mod client;
 mod message;
 
 pub use client::client::Client;
-pub use message::Message;
+pub use message::UserMessage;

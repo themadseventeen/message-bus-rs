@@ -5,7 +5,7 @@ use std::{
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::{Notify, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
 
 use crate::{
     Client,
@@ -17,6 +17,7 @@ pub struct ClientBuilder {
     url: Option<String>,
     client_id: Option<ClientId>,
     reqwest_client: Option<reqwest::Client>,
+    pause_after_poll: bool,
 }
 
 impl Client<()> {
@@ -41,12 +42,18 @@ impl ClientBuilder {
         self
     }
 
+    pub fn pause_after_poll(mut self, pause_after_poll: bool) -> ClientBuilder {
+        self.pause_after_poll = pause_after_poll;
+        self
+    }
+
     pub fn build<T>(self) -> Result<Client<T>, BuilderError>
     where
         T: DeserializeOwned + Clone + Send + Sync,
     {
         let url = self.url.ok_or(BuilderError::UrlMissing)?;
         let (broadcast_tx, _) = broadcast::channel(256);
+
         Ok(Client {
             url,
             client_id: match self.client_id {
@@ -63,6 +70,8 @@ impl ClientBuilder {
             broadcast_tx,
             poller_running: Arc::new(AtomicBool::new(false)),
             state_changed: Arc::new(Notify::new()),
+            pause_after_poll: self.pause_after_poll,
+            resume_tx: Arc::new(Mutex::new(None)),
             _phantom: std::marker::PhantomData,
         })
     }

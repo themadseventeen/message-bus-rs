@@ -9,15 +9,16 @@ use std::{
 use futures::stream::BoxStream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use thiserror::Error;
 use tokio::sync::{
-    Notify, RwLock,
-    broadcast::{self, Sender},
+    Mutex, Notify, RwLock,
+    broadcast::{self},
+    mpsc::{self},
 };
 
 use crate::{
-    Message,
     client::{client_id::ClientId, decoder::body_to_framed_stream},
-    message::MessageType,
+    message::{Data, PollerMessage},
 };
 use async_stream::stream;
 
@@ -29,9 +30,11 @@ where
     pub(crate) client_id: ClientId,
     pub(crate) reqwest_client: reqwest::Client,
     pub(crate) state: Arc<RwLock<ClientState>>,
-    pub(crate) broadcast_tx: Sender<Result<Message<T>, Arc<std::io::Error>>>,
+    pub(crate) broadcast_tx: broadcast::Sender<Result<PollerMessage<T>, Arc<std::io::Error>>>,
     pub(crate) poller_running: Arc<AtomicBool>,
     pub(crate) state_changed: Arc<Notify>,
+    pub(crate) resume_tx: Arc<Mutex<Option<mpsc::Sender<Vec<ResumeCommand>>>>>,
+    pub(crate) pause_after_poll: bool,
     pub(crate) _phantom: std::marker::PhantomData<T>,
 }
 
@@ -40,28 +43,23 @@ pub(crate) struct ClientState {
     pub(crate) subscriptions: HashMap<String, i64>,
 }
 
+pub enum ResumeCommand {
+    Subscribe((String, i64)),
+    Unsubscribe(String),
+}
+
+#[derive(Error, Debug)]
+pub enum ClientError {
+    #[error("no poller")]
+    NoPoller,
+}
+
 impl<T> Client<T>
 where
     T: serde::de::DeserializeOwned + Clone + Sync + Send + 'static,
 {
-    pub fn new(url: String, client_id: ClientId) -> Self {
-        let (broadcast_tx, _) = broadcast::channel(256);
-        Self {
-            url,
-            client_id,
-            reqwest_client: reqwest::Client::new(),
-            state: Arc::new(RwLock::new(ClientState {
-                subscriptions: HashMap::new(),
-            })),
-            broadcast_tx,
-            poller_running: Arc::new(AtomicBool::new(false)),
-            state_changed: Arc::new(Notify::new()),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
     pub fn get_id(&self) -> ClientId {
-        self.client_id.clone()
+        self.client_id
     }
 
     fn ensure_poller_started(&self) {
@@ -106,9 +104,9 @@ where
         self.state_changed.notify_waiters();
     }
 
-    async fn update_last_message_id(state: &Arc<RwLock<ClientState>>, message: &MessageType<T>) {
+    async fn update_last_message_id(state: &Arc<RwLock<ClientState>>, message: &Data<T>) {
         match message {
-            MessageType::Status(hash_map) => {
+            Data::Status(hash_map) => {
                 let mut state = state.write().await;
                 for (t, i) in hash_map.iter() {
                     state
@@ -118,7 +116,7 @@ where
                         .or_insert(*i);
                 }
             }
-            MessageType::Normal(message) => {
+            Data::Normal(message) => {
                 let mut state = state.write().await;
                 state
                     .subscriptions
@@ -129,6 +127,31 @@ where
         };
     }
 
+    pub async fn resume_inner(&self, commands: Vec<ResumeCommand>) -> Result<(), ClientError> {
+        let tx = {
+            let tx = self.resume_tx.lock().await;
+            tx.clone()
+        };
+
+        match tx {
+            Some(sender) => {
+                if let Err(e) = sender.send(commands).await {
+                    return Err(ClientError::NoPoller);
+                }
+            }
+            None => return Err(ClientError::NoPoller),
+        }
+        Ok(())
+    }
+
+    pub async fn resume(&self) -> Result<(), ClientError> {
+        self.resume_inner(vec![]).await
+    }
+
+    pub async fn resume_with(&self, commands: Vec<ResumeCommand>) -> Result<(), ClientError> {
+        self.resume_inner(commands).await
+    }
+
     fn start_background_poller(&self) {
         let url = self.url.clone();
         let client_id = self.client_id;
@@ -137,8 +160,13 @@ where
         let state_changed = Arc::clone(&self.state_changed);
         let broadcast_tx = self.broadcast_tx.clone();
         let poller_running = Arc::clone(&self.poller_running);
+        let resume_tx_holder = self.resume_tx.clone();
+        let pause_after_poll = self.pause_after_poll;
+
+        let (resume_tx, mut resume_rx) = mpsc::channel::<Vec<ResumeCommand>>(1024);
 
         tokio::spawn(async move {
+            resume_tx_holder.lock().await.replace(resume_tx);
             loop {
                 let state_snapshot = {
                     let state = state.read().await;
@@ -171,15 +199,13 @@ where
                 let poll_stream = body_to_framed_stream(response)
                     .map(|val: Result<Value, std::io::Error>| {
                         val.and_then(|v| {
-                            serde_json::from_value::<Vec<MessageType<T>>>(v).map_err(|e| {
+                            serde_json::from_value::<Vec<Data<T>>>(v).map_err(|e| {
                                 std::io::Error::new(std::io::ErrorKind::InvalidData, e)
                             })
                         })
                     })
                     .map_ok(|vec| {
-                        futures::stream::iter(
-                            vec.into_iter().map(Ok::<MessageType<T>, std::io::Error>),
-                        )
+                        futures::stream::iter(vec.into_iter().map(Ok::<Data<T>, std::io::Error>))
                     })
                     .try_flatten();
 
@@ -190,8 +216,8 @@ where
                         msg = poll_stream.next() => {
                             match msg {
                                 Some(Ok(msg_type)) => {
-                                    if let MessageType::Normal(message) = msg_type.clone()
-                                        && broadcast_tx.send(Ok(message)).is_err() {
+                                    if let Data::Normal(message) = msg_type.clone()
+                                        && broadcast_tx.send(Ok(PollerMessage::UserMessage(message))).is_err() {
                                             poller_running.store(false, Ordering::SeqCst);
                                             return;
                                         }
@@ -201,7 +227,16 @@ where
                                 Some(Err(e)) => {
                                     let _ = broadcast_tx.send(Err(Arc::new(e)));
                                 }
-                                None => break,
+                                None => {
+                                    if broadcast_tx.send(Ok(PollerMessage::PollEnded)).is_err() {
+                                        poller_running.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                    if pause_after_poll {
+                                        let _resume = resume_rx.recv().await;
+                                    }
+                                    break;
+                                },
                             }
                         }
                         _ = state_changed.notified() => {
@@ -213,7 +248,7 @@ where
         });
     }
 
-    pub fn stream(&self) -> BoxStream<'static, Result<Message<T>, Arc<std::io::Error>>> {
+    pub fn stream(&self) -> BoxStream<'static, Result<PollerMessage<T>, Arc<std::io::Error>>> {
         self.ensure_poller_started();
         let mut rx = self.broadcast_tx.subscribe();
 
@@ -246,12 +281,9 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn client_test() -> anyhow::Result<()> {
-        // let client: Client<Value> = Client::new(
-        //     "https://forum.warthunder.com/message-bus/".to_owned(),
-        //     ClientId::default(),
-        // );
         let client = Client::builder()
             .url("https://forum.warthunder.com/message-bus/".to_owned())
+            .pause_after_poll(true)
             .build::<Value>()?;
 
         let mut stream_1 = client.stream();
@@ -262,20 +294,14 @@ mod tests {
 
         let handle_1 = tokio::task::spawn(async move {
             while let Some(message) = stream_1.next().await {
-                println!("From 1: {:?}", message);
+                println!("{:?}", message);
             }
         });
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let mut stream_2 = client.stream();
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        let _ = client.resume().await;
 
-        let handle_2 = tokio::task::spawn(async move {
-            while let Some(message) = stream_2.next().await {
-                println!("From 2: {:?}", message);
-            }
-        });
-
-        let _ = tokio::join!(handle_1, handle_2);
+        let _ = tokio::join!(handle_1);
 
         Ok(())
     }
