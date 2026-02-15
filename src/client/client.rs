@@ -135,7 +135,7 @@ where
 
         match tx {
             Some(sender) => {
-                if let Err(e) = sender.send(commands).await {
+                if let Err(_) = sender.send(commands).await {
                     return Err(ClientError::NoPoller);
                 }
             }
@@ -233,7 +233,19 @@ where
                                         return;
                                     }
                                     if pause_after_poll {
-                                        let _resume = resume_rx.recv().await;
+                                        if let Some(commands) = resume_rx.recv().await {
+                                            let mut state = state.write().await;
+                                            for command in commands {
+                                                match command {
+                                                    ResumeCommand::Subscribe((channel, id)) => {
+                                                        state.subscriptions.insert(channel, id);
+                                                    },
+                                                    ResumeCommand::Unsubscribe(channel) => {
+                                                        state.subscriptions.remove(&channel);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                     break;
                                 },
