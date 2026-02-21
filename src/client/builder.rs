@@ -5,12 +5,10 @@ use std::{
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast};
 
-use crate::{
-    Client,
-    client::{client::ClientState, client_id::ClientId},
-};
+use crate::client::client::ClientState;
+use crate::client::{Client, ClientId};
 
 #[derive(Default)]
 pub struct ClientBuilder {
@@ -64,14 +62,13 @@ impl ClientBuilder {
                 Some(http) => http,
                 None => reqwest::Client::default(),
             },
-            state: Arc::new(RwLock::new(ClientState {
-                subscriptions: HashMap::new(),
-            })),
+            state: Arc::new(RwLock::new(ClientState::default())),
             broadcast_tx,
             poller_running: Arc::new(AtomicBool::new(false)),
             state_changed: Arc::new(Notify::new()),
             pause_after_poll: self.pause_after_poll,
             resume_tx: Arc::new(Mutex::new(None)),
+            abort_tx: Arc::new(Mutex::new(None)),
             _phantom: std::marker::PhantomData,
         })
     }

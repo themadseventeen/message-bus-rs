@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    error::Error,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,7 +18,8 @@ use tokio::sync::{
 };
 
 use crate::{
-    client::{client_id::ClientId, decoder::body_to_framed_stream},
+    client::ClientId,
+    client::decoder::body_to_framed_stream,
     message::{Data, PollerMessage},
 };
 use async_stream::stream;
@@ -30,10 +32,11 @@ where
     pub(crate) client_id: ClientId,
     pub(crate) reqwest_client: reqwest::Client,
     pub(crate) state: Arc<RwLock<ClientState>>,
-    pub(crate) broadcast_tx: broadcast::Sender<Result<PollerMessage<T>, Arc<std::io::Error>>>,
+    pub(crate) broadcast_tx: broadcast::Sender<Result<PollerMessage<T>, ClientError>>,
     pub(crate) poller_running: Arc<AtomicBool>,
     pub(crate) state_changed: Arc<Notify>,
     pub(crate) resume_tx: Arc<Mutex<Option<mpsc::Sender<Vec<ResumeCommand>>>>>,
+    pub(crate) abort_tx: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     pub(crate) pause_after_poll: bool,
     pub(crate) _phantom: std::marker::PhantomData<T>,
 }
@@ -41,6 +44,7 @@ where
 #[derive(Default)]
 pub(crate) struct ClientState {
     pub(crate) subscriptions: HashMap<String, i64>,
+    pub(crate) seq: i64,
 }
 
 pub enum ResumeCommand {
@@ -48,10 +52,18 @@ pub enum ResumeCommand {
     Unsubscribe(String),
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ClientError {
     #[error("no poller")]
     NoPoller,
+    #[error("aborted")]
+    Abort,
+    #[error("io error")]
+    IOError(Arc<std::io::Error>),
+    #[error("request error")]
+    RequestError(Arc<reqwest::Error>),
+    #[error("unknown erorr")]
+    UnknownError,
 }
 
 impl<T> Client<T>
@@ -152,6 +164,36 @@ where
         self.resume_inner(commands).await
     }
 
+    pub async fn abort(&self) -> Result<(), ClientError> {
+        let tx = {
+            let tx = self.abort_tx.lock().await;
+            tx.clone()
+        };
+        match tx {
+            Some(sender) => {
+                if let Err(_) = sender.send(()).await {
+                    return Err(ClientError::NoPoller);
+                }
+            }
+            None => return Err(ClientError::NoPoller),
+        }
+        Ok(())
+    }
+
+    pub async fn drain(self) -> Result<Vec<(String, i64)>, ClientError> {
+        self.abort().await?;
+        let state: Vec<(String, i64)> = self
+            .state
+            .read()
+            .await
+            .subscriptions
+            .iter()
+            .map(|i| (i.0.clone(), i.1.clone()))
+            .collect();
+
+        Ok(state)
+    }
+
     fn start_background_poller(&self) {
         let url = self.url.clone();
         let client_id = self.client_id;
@@ -161,12 +203,15 @@ where
         let broadcast_tx = self.broadcast_tx.clone();
         let poller_running = Arc::clone(&self.poller_running);
         let resume_tx_holder = self.resume_tx.clone();
+        let abort_tx_holder = self.abort_tx.clone();
         let pause_after_poll = self.pause_after_poll;
 
         let (resume_tx, mut resume_rx) = mpsc::channel::<Vec<ResumeCommand>>(1024);
+        let (abort_tx, mut abort_rx) = mpsc::channel::<()>(1024);
 
         tokio::spawn(async move {
             resume_tx_holder.lock().await.replace(resume_tx);
+            abort_tx_holder.lock().await.replace(abort_tx);
             loop {
                 let state_snapshot = {
                     let state = state.read().await;
@@ -180,6 +225,14 @@ where
                     form_data.insert(topic, latest.to_string());
                 }
 
+                let seq = {
+                    let mut state = state.write().await;
+                    state.seq = state.seq + 1;
+                    state.seq.clone()
+                };
+
+                form_data.insert("__seq".to_string(), seq.to_string());
+
                 let response = match reqwest_client
                     .post(&target_url)
                     .form(&form_data)
@@ -188,8 +241,7 @@ where
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        let err = Arc::new(std::io::Error::other(e));
-                        let _ = broadcast_tx.send(Err(err));
+                        let _ = broadcast_tx.send(Err(ClientError::RequestError(Arc::new(e))));
                         continue;
                     }
                 };
@@ -224,8 +276,11 @@ where
                                     Client::update_last_message_id(&state, &msg_type).await;
 
                                 }
-                                Some(Err(e)) => {
-                                    let _ = broadcast_tx.send(Err(Arc::new(e)));
+                                Some(Err(_)) => {
+                                    if let Err(_) = broadcast_tx.send(Err(ClientError::UnknownError)) {
+                                        poller_running.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
                                 }
                                 None => {
                                     if broadcast_tx.send(Ok(PollerMessage::PollEnded)).is_err() {
@@ -254,13 +309,19 @@ where
                         _ = state_changed.notified() => {
                             break;
                         }
+                        _ = abort_rx.recv() => {
+                            println!("POLLING ABORTED! RETURNING!");
+                            poller_running.store(false, Ordering::SeqCst);
+                            let _ = broadcast_tx.send(Err(ClientError::Abort));
+                            return;
+                        }
                     }
                 }
             }
         });
     }
 
-    pub fn stream(&self) -> BoxStream<'static, Result<PollerMessage<T>, Arc<std::io::Error>>> {
+    pub fn stream(&self) -> BoxStream<'static, Result<PollerMessage<T>, ClientError>> {
         self.ensure_poller_started();
         let mut rx = self.broadcast_tx.subscribe();
 
@@ -268,12 +329,17 @@ where
             loop {
                 match rx.recv().await {
                     Ok(Ok(message)) => yield Ok(message),
-                    Ok(Err(err)) => yield Err(Arc::new(std::io::Error::new(err.kind(), err.to_string()))),
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        yield Err(Arc::new(std::io::Error::other(
-                            format!("Stream lagged behind, {} messages dropped", n)
-                        )));
-                    }
+
+                    Ok(Err(err)) => {
+                        if matches!(err, ClientError::Abort) {
+                            break;
+                        }
+
+                        yield Err(err);
+                    },
+
+                    Err(broadcast::error::RecvError::Lagged(_n)) => {
+                    },
                     Err(broadcast::error::RecvError::Closed) => {
                         break;
                     }
@@ -288,15 +354,15 @@ where
 mod tests {
     use std::time::Duration;
 
-    use serde_json::Value;
-
     use super::*;
+    use discourse::model::message_bus::DiscoursePushMessage;
+    use serde_json::Value;
     #[tokio::test]
     async fn client_test() -> anyhow::Result<()> {
         let client = Client::builder()
             .url("https://forum.warthunder.com/message-bus/".to_owned())
             .pause_after_poll(true)
-            .build::<Value>()?;
+            .build::<DiscoursePushMessage>()?;
 
         let mut stream_1 = client.stream();
 
@@ -311,7 +377,10 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_secs(35)).await;
-        let _ = client.resume().await;
+        client.resume().await?;
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        client.abort().await?;
 
         let _ = tokio::join!(handle_1);
 

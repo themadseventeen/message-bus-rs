@@ -1,5 +1,4 @@
-mod client;
-mod message;
+pub mod client;
+pub mod message;
 
-pub use client::client::Client;
 pub use message::UserMessage;
