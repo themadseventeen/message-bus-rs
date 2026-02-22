@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    error::Error,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -84,11 +83,15 @@ where
         }
     }
 
-    pub async fn subscribe(&self, topic: &str, latest_id: i64) {
+    pub async fn subscribe_from(&self, topic: &str, latest_id: i64) {
         let mut state = self.state.write().await;
         state.subscriptions.insert(topic.to_owned(), latest_id);
         drop(state);
         self.state_changed.notify_waiters();
+    }
+
+    pub async fn subscribe(&self, topic: &str) {
+        self.subscribe_from(topic, -1).await;
     }
 
     pub async fn subscribe_all(&self, subscriptions: HashMap<&str, i64>) {
@@ -194,16 +197,46 @@ where
         Ok(state)
     }
 
+    async fn prepare_request(
+        state: Arc<RwLock<ClientState>>,
+        client: &reqwest::Client,
+        target_url: &str,
+    ) -> reqwest::RequestBuilder {
+        let state_snapshot = {
+            let state = state.read().await;
+            state.subscriptions.clone()
+        };
+
+        let mut form_data = HashMap::new();
+
+        for (topic, latest) in state_snapshot {
+            form_data.insert(topic, latest.to_string());
+        }
+
+        let seq = {
+            let mut state = state.write().await;
+            state.seq = state.seq + 1;
+            state.seq.clone()
+        };
+
+        form_data.insert("__seq".to_string(), seq.to_string());
+
+        client.post(target_url).form(&form_data)
+    }
+
     fn start_background_poller(&self) {
         let url = self.url.clone();
         let client_id = self.client_id;
         let reqwest_client = self.reqwest_client.clone();
+
         let state = Arc::clone(&self.state);
         let state_changed = Arc::clone(&self.state_changed);
-        let broadcast_tx = self.broadcast_tx.clone();
         let poller_running = Arc::clone(&self.poller_running);
+
+        let broadcast_tx = self.broadcast_tx.clone();
         let resume_tx_holder = self.resume_tx.clone();
         let abort_tx_holder = self.abort_tx.clone();
+
         let pause_after_poll = self.pause_after_poll;
 
         let (resume_tx, mut resume_rx) = mpsc::channel::<Vec<ResumeCommand>>(1024);
@@ -212,33 +245,12 @@ where
         tokio::spawn(async move {
             resume_tx_holder.lock().await.replace(resume_tx);
             abort_tx_holder.lock().await.replace(abort_tx);
+            let target_url = format!("{}{}/poll", url, client_id);
             loop {
-                let state_snapshot = {
-                    let state = state.read().await;
-                    state.subscriptions.clone()
-                };
+                let post_request =
+                    Client::<T>::prepare_request(state.clone(), &reqwest_client, &target_url).await;
 
-                let target_url = format!("{}{}/poll", url, client_id);
-                let mut form_data = HashMap::new();
-
-                for (topic, latest) in state_snapshot {
-                    form_data.insert(topic, latest.to_string());
-                }
-
-                let seq = {
-                    let mut state = state.write().await;
-                    state.seq = state.seq + 1;
-                    state.seq.clone()
-                };
-
-                form_data.insert("__seq".to_string(), seq.to_string());
-
-                let response = match reqwest_client
-                    .post(&target_url)
-                    .form(&form_data)
-                    .send()
-                    .await
-                {
+                let response = match post_request.send().await {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = broadcast_tx.send(Err(ClientError::RequestError(Arc::new(e))));
@@ -269,7 +281,7 @@ where
                             match msg {
                                 Some(Ok(msg_type)) => {
                                     if let Data::Normal(message) = msg_type.clone()
-                                        && broadcast_tx.send(Ok(PollerMessage::UserMessage(message))).is_err() {
+                                        && broadcast_tx.send(Ok(PollerMessage::UserMessage(Arc::new(message)))).is_err() {
                                             poller_running.store(false, Ordering::SeqCst);
                                             return;
                                         }
@@ -310,7 +322,6 @@ where
                             break;
                         }
                         _ = abort_rx.recv() => {
-                            println!("POLLING ABORTED! RETURNING!");
                             poller_running.store(false, Ordering::SeqCst);
                             let _ = broadcast_tx.send(Err(ClientError::Abort));
                             return;
@@ -321,21 +332,19 @@ where
         });
     }
 
-    pub fn stream(&self) -> BoxStream<'static, Result<PollerMessage<T>, ClientError>> {
+    pub fn stream(&self) -> BoxStream<'static, PollerMessage<T>> {
         self.ensure_poller_started();
         let mut rx = self.broadcast_tx.subscribe();
 
         let s = stream! {
             loop {
                 match rx.recv().await {
-                    Ok(Ok(message)) => yield Ok(message),
+                    Ok(Ok(message)) => yield message,
 
                     Ok(Err(err)) => {
                         if matches!(err, ClientError::Abort) {
                             break;
                         }
-
-                        yield Err(err);
                     },
 
                     Err(broadcast::error::RecvError::Lagged(_n)) => {
@@ -357,30 +366,37 @@ mod tests {
     use super::*;
     use discourse::model::message_bus::DiscoursePushMessage;
     use serde_json::Value;
+    use tokio::time;
     #[tokio::test]
     async fn client_test() -> anyhow::Result<()> {
         let client = Client::builder()
-            .url("https://forum.warthunder.com/message-bus/".to_owned())
-            .pause_after_poll(true)
+            .url("https://forum.warthunder.com/message-bus/")
             .build::<DiscoursePushMessage>()?;
 
         let mut stream_1 = client.stream();
 
         use futures::StreamExt;
 
-        client.subscribe("/latest", -1).await;
+        client.subscribe("/latest").await;
 
         let handle_1 = tokio::task::spawn(async move {
             while let Some(message) = stream_1.next().await {
-                println!("{:?}", message);
+                match message {
+                    PollerMessage::UserMessage(data) => {
+                        println!("{data:?}");
+                    }
+                    PollerMessage::PollEnded => {}
+                }
             }
         });
 
-        tokio::time::sleep(Duration::from_secs(35)).await;
-        client.resume().await?;
-
         tokio::time::sleep(Duration::from_secs(20)).await;
+        let start = time::Instant::now();
         client.abort().await?;
+        let idk = client.drain().await;
+        let stop = time::Instant::now();
+        println!("{idk:?}");
+        println!("{:?}", (stop - start));
 
         let _ = tokio::join!(handle_1);
 

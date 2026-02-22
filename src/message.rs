@@ -2,13 +2,14 @@ use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum PollerMessage<T>
 where
     T: Clone,
 {
-    UserMessage(UserMessage<T>),
+    UserMessage(Arc<UserMessage<T>>),
     PollEnded,
 }
 

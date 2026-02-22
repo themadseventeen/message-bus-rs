@@ -25,8 +25,8 @@ impl Client<()> {
 }
 
 impl ClientBuilder {
-    pub fn url(mut self, url: String) -> ClientBuilder {
-        self.url = Some(url);
+    pub fn url(mut self, url: impl Into<String>) -> ClientBuilder {
+        self.url = Some(url.into());
         self
     }
 
