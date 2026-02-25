@@ -5,4 +5,5 @@ mod decoder;
 
 pub use builder::ClientBuilder;
 pub use client::Client;
+pub use client::ResumeCommand;
 pub use client_id::ClientId;
