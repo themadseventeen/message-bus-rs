@@ -1,23 +1,18 @@
-use serde::Deserialize;
 use serde::de::{self, DeserializeOwned, Deserializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[derive(Debug, Clone)]
-pub enum PollerMessage<T>
-where
-    T: Clone,
-{
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(bound(deserialize = "Arc<UserMessage<T>>: Deserialize<'de>"))]
+pub enum PollerMessage<T> {
     UserMessage(Arc<UserMessage<T>>),
     PollEnded,
 }
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct UserMessage<T>
-where
-    T: Clone,
-{
+#[derive(Deserialize, Debug, Clone, Serialize)]
+pub struct UserMessage<T> {
     pub global_id: i64,
     pub message_id: i64,
     pub channel: String,

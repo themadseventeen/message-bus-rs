@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
