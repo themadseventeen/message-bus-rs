@@ -3,6 +3,8 @@ mod client;
 mod client_id;
 mod decoder;
 
+mod tests;
+
 pub use builder::ClientBuilder;
 pub use client::Client;
 pub use client::ResumeCommand;

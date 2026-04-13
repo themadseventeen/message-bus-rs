@@ -1,18 +1,31 @@
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::Decoder;
 
-use futures::TryStreamExt;
-use std::io;
-use tokio_util::codec::FramedRead;
-use tokio_util::io::StreamReader;
+use std::sync::Arc;
+
+use crate::client::client::ClientError;
 
 pub fn body_to_framed_stream(
     resp: reqwest::Response,
-) -> impl futures::Stream<Item = Result<serde_json::Value, io::Error>> {
-    let byte_stream = resp.bytes_stream().map_err(io::Error::other);
+) -> impl futures::Stream<Item = Result<serde_json::Value, ClientError>> {
+    let mut buf = BytesMut::new();
+    let mut codec = MessageBusCodec;
 
-    let reader = StreamReader::new(byte_stream);
-    FramedRead::new(reader, MessageBusCodec)
+    use futures::StreamExt;
+    resp.bytes_stream().map(move |item| {
+        match item {
+            Ok(chunk) => {
+                buf.extend_from_slice(&chunk);
+
+                match codec.decode(&mut buf) {
+                    Ok(Some(value)) => Ok(value),
+                    Ok(None) => Err(ClientError::Incomplete),
+                    Err(e) => Err(ClientError::IoError(e)),
+                }
+            }
+            Err(e) => Err(ClientError::RequestError(Arc::new(e))),
+        }
+    })
 }
 
 pub struct MessageBusCodec;

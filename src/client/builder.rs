@@ -1,10 +1,11 @@
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, RwLock, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::client::client::ClientState;
+use crate::client::client::{ClientState, IStreamItem};
 use crate::client::{Client, ClientId};
 
 #[derive(Default)]
@@ -47,7 +48,7 @@ impl ClientBuilder {
         T: DeserializeOwned + Clone + Send + Sync,
     {
         let url = self.url.ok_or(BuilderError::UrlMissing)?;
-        let (broadcast_tx, _) = broadcast::channel(256);
+        let (tx, rx) = tokio::sync::mpsc::channel::<IStreamItem<T>>(100);
 
         Ok(Client {
             url,
@@ -60,7 +61,8 @@ impl ClientBuilder {
                 None => reqwest::Client::default(),
             },
             state: Arc::new(RwLock::new(ClientState::default())),
-            broadcast_tx,
+            sender: tx,
+            receiver: Mutex::new(Some(rx)),
             poller_running: Arc::new(AtomicBool::new(false)),
             state_changed: Arc::new(Notify::new()),
             pause_after_poll: self.pause_after_poll,
